@@ -198,15 +198,35 @@ func processURL(currentURLStr string, keyword string, targetDomain string,
 
 		// Check if the link is within the target domain.
 		if linkURL.Hostname() == targetDomain {
+			var shouldAttemptEnqueue bool
 			mu.Lock()
-			if !(*visited)[normalizedLinkStr] { // If not already visited (or marked for queuing).
-				(*visited)[normalizedLinkStr] = true // Mark as "will be queued".
-				wg.Add(1)                            // This new link represents a new task for the WaitGroup.
-				mu.Unlock()
+			if !(*visited)[normalizedLinkStr] {
+				(*visited)[normalizedLinkStr] = true // Mark as "will attempt to queue"
+				shouldAttemptEnqueue = true
+			}
+			mu.Unlock()
 
-				queue <- normalizedLinkStr // Add new link to the processing queue. This can block if queue is full.
-			} else {
-				mu.Unlock() // Must unlock if the link was already visited/queued.
+			if shouldAttemptEnqueue {
+				// This link was not previously marked. It represents a new potential task.
+				wg.Add(1) // Optimistically Add for this new task.
+
+				select {
+				case queue <- normalizedLinkStr:
+					// Successfully enqueued. The wg.Add(1) stands.
+					// The launched processURL for this normalizedLinkStr will eventually call wg.Done().
+				default:
+					// Queue was full. Link was not enqueued by this worker.
+					log.Printf("Queue full. Link %s not enqueued by this worker. Reverting visited status.", normalizedLinkStr)
+
+					// Since the task was not actually enqueued, we must decrement the WaitGroup
+					// to counteract the optimistic wg.Add(1).
+					wg.Done() 
+					
+					// Revert the visited status so another worker might pick it up later.
+					mu.Lock()
+					delete(*visited, normalizedLinkStr) // Unmark
+					mu.Unlock()
+				}
 			}
 		}
 	}
@@ -223,9 +243,11 @@ func extractLinks(n *html.Node, baseURL *url.URL) []*url.URL {
 					// Filter for http/https schemes.
 					if linkURL.Scheme == "http" || linkURL.Scheme == "https" {
 						linkURL.Fragment = "" // Remove fragments as they don't point to new content.
-						if linkURL.String() != "" && linkURL.String() != baseURL.String() { // Avoid empty or self-referential links post-fragment removal
-						    links = append(links, linkURL)
-                        }
+						// Avoid empty or self-referential links post-fragment removal,
+						// and links that are identical to the base URL.
+						if parsedStr := linkURL.String(); parsedStr != "" && parsedStr != strings.TrimRight(baseURL.String(),"/") {
+							links = append(links, linkURL)
+						}
 					}
 				}
 				break // Found href, no need to check other attributes of this <a> tag.
